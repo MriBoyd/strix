@@ -135,7 +135,7 @@ async def create_scan_plan(
         scan_mode=scan_mode,
         safe_mode_override=safe_mode,
     )
-    return plan.to_json(compact=True, indent=2)
+    return plan.to_json(compact=False, indent=2)
 
 
 @function_tool(timeout=30)
