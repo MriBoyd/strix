@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from strix.agents.planner import ScanPlan, ScanPlanner
-from strix.core.tci import ApiSurface, TargetFingerprint
+from strix.core.tci import ApiSurface, TargetFingerprint, calculate_tci
+from strix.modules.registry import PriorityTier, ScanModule
 
 
 def test_planner_generates_exact_payload_schema() -> None:
@@ -198,3 +201,120 @@ def test_plan_helpers_and_aggregation() -> None:
     assert "quota" in full_dict
     assert "skills" in full_dict
     assert "reason" in full_dict
+
+
+def test_priority_filter_prerequisite_resolution() -> None:
+    """Issue 2: priority_filter keeps business-logic and includes auth-enum prerequisite."""
+    planner = ScanPlanner()
+    target = "https://app.local"
+    # Target with low complexity so business-logic is medium priority
+    fp = TargetFingerprint(
+        target=target,
+        auth_patterns=["session_cookie"],
+        data_sensitivity="low",
+    )
+
+    # By default, include_prerequisites=True: auth-enum is included before business-logic
+    plan_with_prereq = planner.generate_plan(
+        target,
+        fp,
+        priority_filter=["medium"],
+        include_prerequisites=True,
+    )
+    names = plan_with_prereq.module_names()
+    assert "business-logic" in names
+    assert "auth-enum" in names
+    assert names.index("auth-enum") < names.index("business-logic")
+
+    # With include_prerequisites=False: business-logic dropped when requirement cannot be met
+    plan_without_prereq = planner.generate_plan(
+        target,
+        fp,
+        priority_filter=["medium"],
+        include_prerequisites=False,
+    )
+    assert "business-logic" not in plan_without_prereq.module_names()
+
+
+def test_priority_elevation_before_mode_filtering() -> None:
+    """Issue 5: high TCI targets elevate business-logic before quick mode filtering."""
+    planner = ScanPlanner()
+    target = "https://complex.example.com"
+    # High complexity target (TCI >= 70)
+    fp_complex = TargetFingerprint(
+        target=target,
+        open_ports=[443, 8080, 8443, 5432],
+        protocols=["https", "grpc"],
+        auth_patterns=["jwt", "oauth2", "mfa", "rbac"],
+        api_surface=ApiSurface(endpoints_count=60, api_types=["rest", "graphql"], has_spec=True),
+        backend_technologies=["fastapi", "spring", "postgres", "redis"],
+        waf_cdn=["cloudflare_waf", "aws_waf"],
+        data_sensitivity="financial",
+        patch_posture="legacy",
+    )
+    tci = calculate_tci(fp_complex).score
+    assert tci >= 70.0
+
+    # Quick mode keeps business-logic because its final effective priority was elevated to high
+    plan_quick = planner.generate_plan(target, fp_complex, scan_mode="quick")
+    names = plan_quick.module_names()
+    assert "business-logic" in names
+    step = plan_quick.get_step_by_module("business-logic")
+    assert step is not None
+    assert step.priority == "high"
+
+    # User override elevates a medium module so quick mode keeps it
+    plan_override = planner.generate_plan(
+        target,
+        fp_complex,
+        scan_mode="quick",
+        module_overrides={"cors-misconfig": {"priority": "high"}},
+    )
+    assert "cors-misconfig" in plan_override.module_names()
+
+
+def test_circular_prerequisite_detection() -> None:
+    """Issue 9: circular prerequisites report ValueError clearly instead of RecursionError."""
+    planner = ScanPlanner()
+
+    # 2-module cycle: A -> B -> A
+    mod_a = ScanModule(
+        name="cycle-a",
+        description="Module A",
+        category="injection",
+        default_priority=PriorityTier.MEDIUM,
+        prerequisites=["cycle-b"],
+    )
+    mod_b = ScanModule(
+        name="cycle-b",
+        description="Module B",
+        category="injection",
+        default_priority=PriorityTier.MEDIUM,
+        prerequisites=["cycle-a"],
+    )
+
+    with pytest.raises(ValueError, match="Circular prerequisite dependency detected"):
+        planner._order_modules([mod_a, mod_b])
+
+    # 3-module cycle: X -> Y -> Z -> X
+    mod_x = ScanModule(
+        name="cycle-x",
+        description="Module X",
+        category="api",
+        prerequisites=["cycle-y"],
+    )
+    mod_y = ScanModule(
+        name="cycle-y",
+        description="Module Y",
+        category="api",
+        prerequisites=["cycle-z"],
+    )
+    mod_z = ScanModule(
+        name="cycle-z",
+        description="Module Z",
+        category="api",
+        prerequisites=["cycle-x"],
+    )
+
+    with pytest.raises(ValueError, match="Circular prerequisite dependency detected"):
+        planner._order_modules([mod_x, mod_y, mod_z])

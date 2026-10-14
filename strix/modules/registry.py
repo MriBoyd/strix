@@ -9,7 +9,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from strix.core.tci import TargetFingerprint
+from strix.core.tci import TargetFingerprint, normalize_target_type
 
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,7 @@ class ScanModule(BaseModel):
     requires_api: bool = False
     requires_graphql: bool = False
     requires_jwt: bool = False
+    requires_oauth: bool = False
 
 
 class ModuleRegistry:
@@ -171,6 +172,7 @@ class ModuleRegistry:
             if isinstance(fingerprint, TargetFingerprint)
             else TargetFingerprint(**fingerprint)
         )
+        canonical_target_type = normalize_target_type(fp.target_type)
 
         with self._lock:
             candidates = list(self._modules.values())
@@ -178,8 +180,12 @@ class ModuleRegistry:
         applicable: list[ScanModule] = []
         has_auth = bool(fp.auth_patterns)
         has_jwt = any("jwt" in p.lower() for p in fp.auth_patterns)
+        has_oauth = any(
+            any(tok in p.lower() for tok in ("oauth", "oauth2", "oidc", "sso", "saml"))
+            for p in fp.auth_patterns
+        )
         has_api = (
-            fp.target_type == "api"
+            canonical_target_type == "api"
             or fp.api_surface.endpoints_count > 0
             or bool(fp.api_surface.api_types)
         )
@@ -189,13 +195,19 @@ class ModuleRegistry:
 
         for mod in candidates:
             # Target type check
-            if fp.target_type and mod.target_types and fp.target_type not in mod.target_types:
+            if (
+                canonical_target_type
+                and mod.target_types
+                and canonical_target_type not in mod.target_types
+            ):
                 continue
 
             # Feature conditions
             if mod.requires_auth and not has_auth:
                 continue
             if mod.requires_jwt and not has_jwt:
+                continue
+            if mod.requires_oauth and not has_oauth:
                 continue
             if mod.requires_api and not has_api:
                 continue
@@ -354,6 +366,7 @@ class ModuleRegistry:
                 skills=["protocols/oauth"],
                 tags=["oauth", "oidc", "auth"],
                 requires_auth=True,
+                requires_oauth=True,
             ),
             ScanModule(
                 name="graphql-audit",

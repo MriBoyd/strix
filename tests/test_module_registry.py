@@ -150,3 +150,81 @@ def test_register_module_helper() -> None:
         assert default_registry.get("test-singleton-mod") == test_mod
     finally:
         default_registry.unregister("test-singleton-mod")
+
+
+def test_oauth_audit_requires_oauth_not_just_any_auth() -> None:
+    """Issue 6: oauth-audit must require OAuth/OIDC rather than any generic auth."""
+    reg = ModuleRegistry(populate_defaults=True)
+
+    # Basic auth target: should NOT have oauth-audit
+    fp_basic = TargetFingerprint(
+        target="https://basic.example.com",
+        target_type="web_app",
+        auth_patterns=["basic"],
+    )
+    names_basic = {m.name for m in reg.find_applicable(fp_basic)}
+    assert "oauth-audit" not in names_basic
+    assert "auth-enum" in names_basic
+
+    # Session cookie target: should NOT have oauth-audit
+    fp_session = TargetFingerprint(
+        target="https://session.example.com",
+        target_type="web_app",
+        auth_patterns=["session_cookie"],
+    )
+    names_session = {m.name for m in reg.find_applicable(fp_session)}
+    assert "oauth-audit" not in names_session
+    assert "auth-enum" in names_session
+
+    # OAuth2 target: SHOULD have oauth-audit
+    fp_oauth = TargetFingerprint(
+        target="https://oauth.example.com",
+        target_type="web_app",
+        auth_patterns=["oauth2"],
+    )
+    names_oauth = {m.name for m in reg.find_applicable(fp_oauth)}
+    assert "oauth-audit" in names_oauth
+
+    # OIDC target: SHOULD have oauth-audit
+    fp_oidc = TargetFingerprint(
+        target="https://oidc.example.com",
+        target_type="web_app",
+        auth_patterns=["oidc"],
+    )
+    names_oidc = {m.name for m in reg.find_applicable(fp_oidc)}
+    assert "oauth-audit" in names_oidc
+
+
+def test_find_applicable_maps_target_type_aliases_and_rejects_unknown() -> None:
+    """Issue 3: find_applicable accepts existing target type aliases and rejects unknown types."""
+    reg = ModuleRegistry(populate_defaults=True)
+
+    # Existing configuration uses web_application
+    fp_web_app = {"target": "https://app.example.com", "target_type": "web_application"}
+    modules_web = reg.find_applicable(fp_web_app)
+    assert len(modules_web) > 0
+    web_names = {m.name for m in modules_web}
+    assert "sqli-fuzz" in web_names
+    assert "xss-test" in web_names
+
+    # Existing configuration uses api_spec
+    fp_api_spec = {
+        "target": "https://api.example.com",
+        "target_type": "api_spec",
+        "api_surface": {"endpoints_count": 5},
+    }
+    modules_api = reg.find_applicable(fp_api_spec)
+    assert len(modules_api) > 0
+    api_names = {m.name for m in modules_api}
+    assert "api-route-fuzz" in api_names
+
+    # Existing configuration uses local_code
+    fp_code = {"target": "/src/repo", "target_type": "local_code"}
+    modules_code = reg.find_applicable(fp_code)
+    assert len(modules_code) > 0
+    code_names = {m.name for m in modules_code}
+    assert "traversal-test" in code_names
+
+    # Reject unknown target types with explicit ValueError
+    with pytest.raises(ValueError, match="Unknown target type 'mainframe_cobol'"):
+        reg.find_applicable({"target": "host", "target_type": "mainframe_cobol"})

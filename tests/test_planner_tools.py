@@ -105,3 +105,44 @@ async def test_list_scan_modules_tool() -> None:
     filtered = json.loads(filtered_raw)
     for m in filtered:
         assert m["category"] == "authentication"
+
+
+async def test_tools_reject_malformed_fingerprint_json() -> None:
+    """Issue 4: malformed JSON returns an explicit error payload."""
+    # 1. Malformed JSON to calculate_target_complexity
+    raw_calc = await calculate_target_complexity.on_invoke_tool(
+        _make_ctx("calculate_target_complexity"),
+        json.dumps({"target": "https://test.local", "fingerprint": "{malformed json"}),
+    )
+    res_calc = json.loads(raw_calc)
+    assert "error" in res_calc
+    assert "Invalid fingerprint JSON" in res_calc["error"]
+
+    # 2. Malformed JSON to create_scan_plan
+    raw_plan = await create_scan_plan.on_invoke_tool(
+        _make_ctx("create_scan_plan"),
+        json.dumps({"target": "https://test.local", "fingerprint": "{malformed json"}),
+    )
+    res_plan = json.loads(raw_plan)
+    assert "error" in res_plan
+    assert "Invalid fingerprint JSON" in res_plan["error"]
+
+    # 3. Non-dict JSON (e.g. array) to calculate_target_complexity
+    raw_arr = await calculate_target_complexity.on_invoke_tool(
+        _make_ctx("calculate_target_complexity"),
+        json.dumps({"target": "https://test.local", "fingerprint": "[1, 2, 3]"}),
+    )
+    res_arr = json.loads(raw_arr)
+    assert "error" in res_arr
+    assert "must be an object" in res_arr["error"]
+
+    # 4. Unknown target type returns explicit error
+    raw_unk = await calculate_target_complexity.on_invoke_tool(
+        _make_ctx("calculate_target_complexity"),
+        json.dumps(
+            {"target": "https://test.local", "fingerprint": json.dumps({"target_type": "quantum"})}
+        ),
+    )
+    res_unk = json.loads(raw_unk)
+    assert "error" in res_unk
+    assert "Unknown target type" in res_unk["error"]

@@ -18,6 +18,75 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 logger = logging.getLogger(__name__)
 
 
+SUPPORTED_TARGET_TYPES: frozenset[str] = frozenset({"web_app", "api", "whitebox", "infra", "cloud"})
+
+TARGET_TYPE_ALIASES: dict[str, str] = {
+    # web
+    "web_app": "web_app",
+    "web_application": "web_app",
+    "web": "web_app",
+    "url": "web_app",
+    "domain": "web_app",
+    "hostname": "web_app",
+    # api
+    "api": "api",
+    "api_spec": "api",
+    "openapi": "api",
+    "swagger": "api",
+    "rest": "api",
+    "graphql": "api",
+    # whitebox / code
+    "whitebox": "whitebox",
+    "local_code": "whitebox",
+    "code": "whitebox",
+    "source_code": "whitebox",
+    "repository": "whitebox",
+    "repo": "whitebox",
+    # infra
+    "infra": "infra",
+    "infrastructure": "infra",
+    "network": "infra",
+    "ip": "infra",
+    "ip_address": "infra",
+    "host": "infra",
+    # cloud
+    "cloud": "cloud",
+    "aws": "cloud",
+    "azure": "cloud",
+    "gcp": "cloud",
+}
+
+
+def normalize_target_type(target_type: str | None) -> str:
+    """Normalize and validate a target type string to canonical form.
+
+    Raises:
+        ValueError: If target_type is unrecognized.
+    """
+    if not target_type:
+        return "web_app"
+    clean = target_type.strip().lower()
+    canonical = TARGET_TYPE_ALIASES.get(clean)
+    if canonical is None:
+        valid_options = ", ".join(sorted(SUPPORTED_TARGET_TYPES))
+        msg = f"Unknown target type '{target_type}'. Supported canonical types: {valid_options}."
+        raise ValueError(msg)
+    return canonical
+
+
+def _dedup_clean_strings(values: list[str]) -> list[str]:
+    """Clean and deduplicate list of strings preserving insertion order."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in values:
+        if isinstance(item, str):
+            clean = item.strip().lower()
+            if clean and clean not in seen:
+                seen.add(clean)
+                result.append(clean)
+    return result
+
+
 class TCILevel(StrEnum):
     """Complexity tiers based on TCI score."""
 
@@ -38,6 +107,11 @@ class ApiSurface(BaseModel):
     has_spec: bool = False
     dynamic_routes: bool = False
 
+    @field_validator("api_types", mode="after")
+    @classmethod
+    def _dedup_api_types(cls, v: list[str]) -> list[str]:
+        return _dedup_clean_strings(v)
+
 
 class TargetFingerprint(BaseModel):
     """Structured fingerprint of a target's observable characteristics."""
@@ -56,6 +130,28 @@ class TargetFingerprint(BaseModel):
     data_sensitivity: str = "standard"
     patch_posture: str = "unknown"
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("target_type", mode="after")
+    @classmethod
+    def _validate_target_type(cls, v: str) -> str:
+        return normalize_target_type(v)
+
+    @field_validator("open_ports", mode="after")
+    @classmethod
+    def _dedup_ports(cls, v: list[int]) -> list[int]:
+        return sorted({p for p in v if isinstance(p, int) and p > 0})
+
+    @field_validator(
+        "protocols",
+        "auth_patterns",
+        "frontend_technologies",
+        "backend_technologies",
+        "waf_cdn",
+        mode="after",
+    )
+    @classmethod
+    def _dedup_string_lists(cls, v: list[str]) -> list[str]:
+        return _dedup_clean_strings(v)
 
     @field_validator("api_surface", mode="before")
     @classmethod
@@ -168,8 +264,8 @@ def calc_ports_protocols_score(ports: list[int], protocols: list[str]) -> tuple[
     score = 0.0
     notes: list[str] = []
 
-    clean_ports = list(dict.fromkeys(p for p in ports if isinstance(p, int) and p > 0))
-    clean_protocols = [p.lower().strip() for p in protocols if isinstance(p, str) and p.strip()]
+    clean_ports = sorted({p for p in ports if isinstance(p, int) and p > 0})
+    clean_protocols = _dedup_clean_strings(protocols)
 
     if not clean_ports and not clean_protocols:
         return 10.0, "No open ports or protocols reported (baseline web assumption)"
@@ -245,13 +341,15 @@ _AUTH_BASE_SCORES: dict[str, float] = {
 
 def calc_auth_score(auth_patterns: list[str]) -> tuple[float, str]:
     """Score authentication complexity (0..100)."""
-    clean_patterns = [p.lower().strip() for p in auth_patterns if isinstance(p, str) and p.strip()]
+    clean_patterns = _dedup_clean_strings(auth_patterns)
     if not clean_patterns:
         return 0.0, "No authentication mechanisms detected"
 
     max_base = 0.0
     matched: list[str] = []
     bonus = 0.0
+    has_mfa = False
+    has_rbac = False
 
     for pattern in clean_patterns:
         score = _AUTH_BASE_SCORES.get(pattern)
@@ -259,14 +357,19 @@ def calc_auth_score(auth_patterns: list[str]) -> tuple[float, str]:
             max_base = max(max_base, score)
             matched.append(pattern)
         elif any(k in pattern for k in ("mfa", "2fa", "totp")):
-            bonus += 15.0
+            has_mfa = True
             matched.append("mfa")
         elif any(k in pattern for k in ("rbac", "abac", "multi_role", "tenant", "multi_tenant")):
-            bonus += 15.0
+            has_rbac = True
             matched.append("rbac/multi-tenant")
         else:
             max_base = max(max_base, 30.0)
             matched.append(pattern)
+
+    if has_mfa:
+        bonus += 15.0
+    if has_rbac:
+        bonus += 15.0
 
     # Multi-pattern complexity
     distinct_mechanisms = len(set(matched))
@@ -303,15 +406,15 @@ def calc_api_surface_score(api_surface: ApiSurface | dict[str, Any]) -> tuple[fl
     surface = ApiSurface(**api_surface) if isinstance(api_surface, dict) else api_surface
 
     notes: list[str] = []
-    base_score, count_note = _score_endpoint_count(surface.endpoints_count, bool(surface.api_types))
+    clean_api_types = _dedup_clean_strings(surface.api_types)
+    base_score, count_note = _score_endpoint_count(surface.endpoints_count, bool(clean_api_types))
     if count_note:
         notes.append(count_note)
 
     score = base_score
 
-    # API Types diversity
-    for api_type in surface.api_types:
-        atype = api_type.lower().strip()
+    # API Types diversity (deduplicated)
+    for atype in clean_api_types:
         if atype in ("graphql", "grpc"):
             score += 20.0
             notes.append(atype.upper())
@@ -393,8 +496,8 @@ def calc_tech_stack_score(
     backend: list[str],
 ) -> tuple[float, str]:
     """Score technology stack heterogeneity and modern complexity (0..100)."""
-    clean_fe = [f.lower().strip() for f in frontend if isinstance(f, str) and f.strip()]
-    clean_be = [b.lower().strip() for b in backend if isinstance(b, str) and b.strip()]
+    clean_fe = _dedup_clean_strings(frontend)
+    clean_be = _dedup_clean_strings(backend)
 
     score = 15.0  # baseline
     notes: list[str] = []
@@ -407,9 +510,13 @@ def calc_tech_stack_score(
         score += 15.0
         notes.append(f"Frontend: {clean_fe}")
 
-    matched_be = [
-        b for b in clean_be if b in _BACKEND_FRAMEWORKS or any(k in b for k in _BACKEND_FRAMEWORKS)
-    ]
+    matched_be = list(
+        dict.fromkeys(
+            b
+            for b in clean_be
+            if b in _BACKEND_FRAMEWORKS or any(k in b for k in _BACKEND_FRAMEWORKS)
+        )
+    )
     if len(matched_be) > 1:
         score += 35.0
         notes.append(f"Polyglot/microservice backend: {clean_be}")
@@ -420,7 +527,7 @@ def calc_tech_stack_score(
         score += 15.0
         notes.append(f"Backend: {clean_be}")
 
-    matched_db = [b for b in clean_be if b in _DB_ENGINES]
+    matched_db = list(dict.fromkeys(b for b in clean_be if b in _DB_ENGINES))
     if matched_db:
         db_pts = min(20.0, len(matched_db) * 10.0)
         score += db_pts
@@ -448,7 +555,7 @@ _WAF_PROVIDERS = frozenset(
 
 def calc_waf_defense_score(waf_cdn: list[str]) -> tuple[float, str]:
     """Score defensive posture and WAF presence (0..100)."""
-    clean_defenses = [d.lower().strip() for d in waf_cdn if isinstance(d, str) and d.strip()]
+    clean_defenses = _dedup_clean_strings(waf_cdn)
     if not clean_defenses:
         return 0.0, "No WAF or edge security detected"
 

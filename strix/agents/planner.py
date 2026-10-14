@@ -142,6 +142,7 @@ class ScanPlanner:
         priority_filter: list[str] | None = None,
         max_steps: int | None = None,
         module_overrides: dict[str, dict[str, Any]] | None = None,
+        include_prerequisites: bool = True,
     ) -> ScanPlan:
         """Generate an adaptive scan plan.
 
@@ -153,6 +154,9 @@ class ScanPlanner:
             priority_filter: Allowed priority tiers (e.g. ['critical', 'high']).
             max_steps: Maximum number of steps to schedule.
             module_overrides: Per-module overrides for priority, safe_mode, quota, timeout_s.
+            include_prerequisites: Whether to automatically include missing required
+                prerequisite modules from applicable pool (default: True). If False or
+                if requirements cannot be met on the target, dependent modules are dropped.
 
         Returns:
             Structured ScanPlan with ordered, prioritized steps.
@@ -160,7 +164,7 @@ class ScanPlanner:
         fp = (
             fingerprint
             if isinstance(fingerprint, TargetFingerprint)
-            else TargetFingerprint(**fingerprint)
+            else TargetFingerprint(**(fingerprint or {}))
         )
         if not fp.target and target:
             fp.target = target
@@ -171,26 +175,45 @@ class ScanPlanner:
         tci_level = tci_res.level.value
 
         # 2. Select applicable modules based on target context
-        candidates = self.registry.find_applicable(fp)
+        applicable = self.registry.find_applicable(fp)
+        applicable_by_name = {m.name: m for m in applicable}
+        overrides_dict = module_overrides or {}
 
-        # 3. Filter candidates by scan_mode
-        candidates = self._filter_by_scan_mode(candidates, scan_mode)
+        # 3. Calculate final effective priorities BEFORE filtering (reflects overrides)
+        effective_priorities: dict[str, PriorityTier] = {}
+        for mod in applicable:
+            effective_priorities[mod.name] = self._resolve_module_priority(
+                mod, fp, tci_score, overrides_dict.get(mod.name, {})
+            )
 
-        # 4. Filter by priority if requested
+        # 4. Filter candidates by scan_mode using effective priority
+        selected = self._filter_by_scan_mode(applicable, scan_mode, effective_priorities)
+
+        # 5. Filter by priority if requested using effective priority
         if priority_filter:
             allowed_p = {p.lower().strip() for p in priority_filter}
-            candidates = [m for m in candidates if m.default_priority.value.lower() in allowed_p]
+            selected = [
+                m
+                for m in selected
+                if effective_priorities.get(m.name, m.default_priority).value.lower() in allowed_p
+            ]
 
-        # 5. Build and adapt plan steps
+        # 6. Resolve prerequisites: include required steps or drop unsatisfied modules
+        candidates = self._resolve_prerequisites(
+            selected, applicable_by_name, include_prerequisites=include_prerequisites
+        )
+
+        # 7. Build and adapt plan steps
         steps = self._build_steps(
             candidates=candidates,
             fp=fp,
             tci_score=tci_score,
             safe_mode_override=safe_mode_override,
-            module_overrides=module_overrides or {},
+            module_overrides=overrides_dict,
+            effective_priorities=effective_priorities,
         )
 
-        # 6. Apply max_steps limit if specified
+        # 8. Apply max_steps limit if specified
         if max_steps is not None:
             if max_steps < 0:
                 raise ValueError("max_steps must be non-negative")
@@ -216,24 +239,82 @@ class ScanPlanner:
             },
         )
 
+    def _resolve_prerequisites(
+        self,
+        selected: list[ScanModule],
+        applicable_by_name: dict[str, ScanModule],
+        include_prerequisites: bool,
+    ) -> list[ScanModule]:
+        """Include required prerequisites or drop modules whose requirements cannot be met."""
+        selected_by_name = {m.name: m for m in selected}
+
+        if include_prerequisites:
+            added_any = True
+            while added_any:
+                added_any = False
+                for m in list(selected_by_name.values()):
+                    for req in m.prerequisites:
+                        if req not in selected_by_name and req in applicable_by_name:
+                            selected_by_name[req] = applicable_by_name[req]
+                            added_any = True
+
+        removed_any = True
+        while removed_any:
+            removed_any = False
+            for name, m in list(selected_by_name.items()):
+                missing = [req for req in m.prerequisites if req not in selected_by_name]
+                if missing:
+                    logger.warning(
+                        "Dropping module '%s' from plan: prerequisite(s) %s cannot be met",
+                        name,
+                        missing,
+                    )
+                    del selected_by_name[name]
+                    removed_any = True
+
+        return list(selected_by_name.values())
+
+    def _resolve_module_priority(
+        self,
+        mod: ScanModule,
+        fp: TargetFingerprint,
+        tci_score: float,
+        overrides: dict[str, Any],
+    ) -> PriorityTier:
+        override = overrides.get("priority")
+        if override is not None:
+            if isinstance(override, PriorityTier):
+                return override
+            try:
+                return PriorityTier(str(override).lower())
+            except ValueError:
+                logger.warning("Invalid priority override '%s' for module '%s'", override, mod.name)
+        elevated_str = self._elevate_priority(mod, fp, tci_score)
+        try:
+            return PriorityTier(elevated_str.lower())
+        except ValueError:
+            return mod.default_priority
+
     def _filter_by_scan_mode(
         self,
         candidates: list[ScanModule],
         scan_mode: str,
+        effective_priorities: dict[str, PriorityTier] | None = None,
     ) -> list[ScanModule]:
         mode = scan_mode.lower().strip()
+
+        def get_p(m: ScanModule) -> PriorityTier:
+            if effective_priorities and m.name in effective_priorities:
+                return effective_priorities[m.name]
+            return m.default_priority
+
         if mode == "quick":
-            return [
-                m
-                for m in candidates
-                if m.default_priority in (PriorityTier.CRITICAL, PriorityTier.HIGH)
-            ]
+            return [m for m in candidates if get_p(m) in (PriorityTier.CRITICAL, PriorityTier.HIGH)]
         if mode == "standard":
             return [
                 m
                 for m in candidates
-                if m.default_priority
-                in (PriorityTier.CRITICAL, PriorityTier.HIGH, PriorityTier.MEDIUM)
+                if get_p(m) in (PriorityTier.CRITICAL, PriorityTier.HIGH, PriorityTier.MEDIUM)
             ]
         return candidates
 
@@ -290,6 +371,7 @@ class ScanPlanner:
         tci_score: float,
         safe_mode_override: bool | None,
         module_overrides: dict[str, dict[str, Any]],
+        effective_priorities: dict[str, PriorityTier] | None = None,
     ) -> list[ScanPlanStep]:
         ordered_modules = self._order_modules(candidates)
         steps: list[ScanPlanStep] = []
@@ -297,12 +379,15 @@ class ScanPlanner:
         for idx, mod in enumerate(ordered_modules, start=1):
             overrides = module_overrides.get(mod.name, {})
 
-            priority_val = overrides.get("priority")
-            priority = (
-                str(priority_val).lower()
-                if priority_val is not None
-                else self._elevate_priority(mod, fp, tci_score)
-            )
+            if effective_priorities and mod.name in effective_priorities:
+                priority = effective_priorities[mod.name].value.lower()
+            else:
+                priority_val = overrides.get("priority")
+                priority = (
+                    str(priority_val).lower()
+                    if priority_val is not None
+                    else self._elevate_priority(mod, fp, tci_score)
+                )
 
             safe_mode = self._resolve_safe_mode(mod, fp, tci_score, safe_mode_override, overrides)
             quota = self._resolve_quota(mod, tci_score, overrides)
@@ -355,7 +440,10 @@ class ScanPlanner:
         return "; ".join(notes)
 
     def _order_modules(self, modules: list[ScanModule]) -> list[ScanModule]:
-        """Order modules tactically by phase and prerequisite dependencies."""
+        """Order modules tactically by phase and prerequisite dependencies.
+
+        Detects circular dependencies and reports them clearly with ValueError.
+        """
         by_name = {m.name: m for m in modules}
 
         def sort_key(m: ScanModule) -> tuple[int, int, int, str]:
@@ -368,15 +456,31 @@ class ScanPlanner:
 
         ordered: list[ScanModule] = []
         placed: set[str] = set()
+        visiting: set[str] = set()
 
-        def place(m: ScanModule) -> None:
+        def place(m: ScanModule) -> bool:
             if m.name in placed:
-                return
-            for req in m.prerequisites:
-                if req in by_name and req not in placed:
-                    place(by_name[req])
-            ordered.append(m)
-            placed.add(m.name)
+                return True
+            if m.name in visiting:
+                msg = f"Circular prerequisite dependency detected involving module '{m.name}'"
+                raise ValueError(msg)
+            visiting.add(m.name)
+            try:
+                for req in m.prerequisites:
+                    if req not in by_name:
+                        logger.warning(
+                            "Cannot place module '%s': prerequisite '%s' cannot be met",
+                            m.name,
+                            req,
+                        )
+                        return False
+                    if not place(by_name[req]):
+                        return False
+                ordered.append(m)
+                placed.add(m.name)
+                return True
+            finally:
+                visiting.remove(m.name)
 
         for mod in sorted_mods:
             place(mod)

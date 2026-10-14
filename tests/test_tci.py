@@ -19,6 +19,7 @@ from strix.core.tci import (
     calc_tech_stack_score,
     calc_waf_defense_score,
     calculate_tci,
+    normalize_target_type,
 )
 
 
@@ -204,3 +205,54 @@ def test_patch_posture_scoring() -> None:
 
     assert s_mod < s_cur < s_unk < s_lag < s_eol
     assert s_eol == 95.0
+
+
+def test_deduplication_prevents_inflated_scores() -> None:
+    """Issue 8: repeated observations must not inflate TCI score."""
+    # API types deduplication
+    score_dupe, _ = calc_api_surface_score(
+        ApiSurface(endpoints_count=0, api_types=["graphql", "graphql"])
+    )
+    score_single, _ = calc_api_surface_score(ApiSurface(endpoints_count=0, api_types=["graphql"]))
+    assert score_dupe == 35.0
+    assert score_dupe == score_single
+
+    # Ports & protocols deduplication
+    s_proto_dupe, _ = calc_ports_protocols_score([443, 443], ["grpc", "grpc"])
+    s_proto_single, _ = calc_ports_protocols_score([443], ["grpc"])
+    assert s_proto_dupe == s_proto_single
+
+    # Auth pattern MFA & repeated deduplication
+    s_mfa_dupe, _ = calc_auth_score(["basic", "mfa", "totp", "mfa"])
+    s_mfa_single, _ = calc_auth_score(["basic", "mfa"])
+    assert s_mfa_dupe == s_mfa_single
+
+    # Tech stack deduplication (no false polyglot bonus)
+    s_stack_dupe, _ = calc_tech_stack_score(["react", "react"], ["django", "django"])
+    s_stack_single, _ = calc_tech_stack_score(["react"], ["django"])
+    assert s_stack_dupe == s_stack_single
+
+    # WAF deduplication (no multi-WAF bonus for repeated provider)
+    s_waf_dupe, _ = calc_waf_defense_score(["cloudflare", "cloudflare"])
+    s_waf_single, _ = calc_waf_defense_score(["cloudflare"])
+    assert s_waf_dupe == 75.0
+    assert s_waf_dupe == s_waf_single
+
+
+def test_target_type_normalization_and_validation() -> None:
+    """Issue 3: target types map aliases and reject unknown types."""
+    assert normalize_target_type("web_application") == "web_app"
+    assert normalize_target_type("api_spec") == "api"
+    assert normalize_target_type("local_code") == "whitebox"
+    assert normalize_target_type("ip_address") == "infra"
+
+    # Fingerprint model normalizes on construction
+    fp = TargetFingerprint(target_type="web_application")
+    assert fp.target_type == "web_app"
+
+    # Reject unknown target types
+    with pytest.raises(ValueError, match="Unknown target type 'quantum_satellite'"):
+        normalize_target_type("quantum_satellite")
+
+    with pytest.raises(ValueError, match="Unknown target type 'quantum_satellite'"):
+        TargetFingerprint(target_type="quantum_satellite")

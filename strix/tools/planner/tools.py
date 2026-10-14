@@ -16,8 +16,13 @@ from strix.modules.registry import default_registry
 logger = logging.getLogger(__name__)
 
 
-def _parse_fingerprint_arg(raw: str | dict[str, Any]) -> dict[str, Any]:
-    """Parse JSON string or dict into fingerprint dictionary."""
+def _parse_fingerprint_arg(raw: Any) -> dict[str, Any]:
+    """Parse JSON string or dict into fingerprint dictionary.
+
+    Raises:
+        ValueError: If raw is invalid JSON.
+        TypeError: If raw is not a JSON string, dict, or parsed value is not a dict.
+    """
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str):
@@ -26,11 +31,15 @@ def _parse_fingerprint_arg(raw: str | dict[str, Any]) -> dict[str, Any]:
             return {}
         try:
             parsed = json.loads(stripped)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse fingerprint JSON argument: %s", raw)
-    return {}
+        except json.JSONDecodeError as exc:
+            msg = f"Invalid fingerprint JSON: {exc}"
+            raise ValueError(msg) from exc
+        if not isinstance(parsed, dict):
+            msg = f"Fingerprint JSON must be an object/dict, got {type(parsed).__name__}"
+            raise TypeError(msg)
+        return parsed
+    msg = f"Fingerprint argument must be a JSON string or dict, got {type(raw).__name__}"
+    raise TypeError(msg)
 
 
 @function_tool(timeout=30)
@@ -68,12 +77,16 @@ async def calculate_target_complexity(
         ``sub_scores``, and descriptive ``breakdown``.
     """
     del ctx  # Unused by calculation
-    fp_dict = _parse_fingerprint_arg(fingerprint)
-    if target and "target" not in fp_dict:
-        fp_dict["target"] = target
+    try:
+        fp_dict = _parse_fingerprint_arg(fingerprint)
+        if target and "target" not in fp_dict:
+            fp_dict["target"] = target
 
-    fp = TargetFingerprint(**fp_dict)
-    res = calculate_tci(fp)
+        fp = TargetFingerprint(**fp_dict)
+        res = calculate_tci(fp)
+    except (ValueError, TypeError) as exc:
+        logger.warning("Error calculating target complexity: %s", exc)
+        return json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2)
 
     payload = {
         "target": target or fp.target,
@@ -124,18 +137,22 @@ async def create_scan_plan(
         ```
     """
     del ctx
-    fp_dict = _parse_fingerprint_arg(fingerprint)
-    if target and "target" not in fp_dict:
-        fp_dict["target"] = target
+    try:
+        fp_dict = _parse_fingerprint_arg(fingerprint)
+        if target and "target" not in fp_dict:
+            fp_dict["target"] = target
 
-    planner = ScanPlanner()
-    plan = planner.generate_plan(
-        target=target,
-        fingerprint=fp_dict,
-        scan_mode=scan_mode,
-        safe_mode_override=safe_mode,
-    )
-    return plan.to_json(compact=False, indent=2)
+        planner = ScanPlanner()
+        plan = planner.generate_plan(
+            target=target,
+            fingerprint=fp_dict,
+            scan_mode=scan_mode,
+            safe_mode_override=safe_mode,
+        )
+        return plan.to_json(compact=False, indent=2)
+    except (ValueError, TypeError) as exc:
+        logger.warning("Error creating scan plan: %s", exc)
+        return json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2)
 
 
 @function_tool(timeout=30)
