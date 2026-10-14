@@ -191,7 +191,9 @@ class ScanPlanner:
         )
 
         # 6. Apply max_steps limit if specified
-        if max_steps is not None and max_steps > 0:
+        if max_steps is not None:
+            if max_steps < 0:
+                raise ValueError("max_steps must be non-negative")
             steps = steps[:max_steps]
             # Renumber sequentially
             for idx, step in enumerate(steps, start=1):
