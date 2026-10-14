@@ -177,7 +177,7 @@ class ModuleRegistry:
 
         applicable: list[ScanModule] = []
         has_auth = bool(fp.auth_patterns)
-        has_jwt = any("jwt" in p.lower() or "bearer" in p.lower() for p in fp.auth_patterns)
+        has_jwt = any("jwt" in p.lower() for p in fp.auth_patterns)
         has_api = (
             fp.target_type == "api"
             or fp.api_surface.endpoints_count > 0
